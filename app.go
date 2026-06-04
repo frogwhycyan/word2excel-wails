@@ -10,6 +10,7 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -469,6 +470,15 @@ func reencodeImage(data []byte, ext string) ([]byte, string) {
 	return buf.Bytes(), ext
 }
 
+func imageDimensions(data []byte) (int, int) {
+	img, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return 0, 0
+	}
+	bounds := img.Bounds()
+	return bounds.Dx(), bounds.Dy()
+}
+
 func parseDocumentXML(xmlData []byte) ([]TableData, error) {
 	xmlData = bytes.TrimPrefix(xmlData, []byte("\xef\xbb\xbf"))
 
@@ -639,6 +649,11 @@ type vMergeState struct {
 	span     int
 }
 
+type pictureAction struct {
+	cellRef string
+	pic     *excelize.Picture
+}
+
 func (a *App) ConvertWordToExcel(wordFilePath string) ConversionResult {
 	if wordFilePath == "" {
 		return ConversionResult{
@@ -706,10 +721,12 @@ func (a *App) ConvertWordToExcel(wordFilePath string) ConversionResult {
 		occupied := make(map[string]bool)
 		var mergeActions []mergeAction
 		activeVMerge := make(map[int]vMergeState) // key = 起始列（startCol）
+		var pictureActions []pictureAction
 
 		for rowIdx, row := range table.Rows {
 			excelRowIdx := rowIdx + 1
 			cursorCol := 1
+			usedVMerge := make(map[int]bool) // 当前行已消费的 vMerge continuation（按 startCol 记录）
 
 			for _, cell := range row.Cells {
 				span := cell.GridSpan
@@ -717,41 +734,68 @@ func (a *App) ConvertWordToExcel(wordFilePath string) ConversionResult {
 					span = 1
 				}
 
-				// 找到本行下一个可用列（跳过被水平合并占用的列）
-				for occupied[fmt.Sprintf("%d,%d", excelRowIdx, cursorCol)] {
-					cursorCol++
-				}
-				actualCol := cursorCol
-				rangeStart, rangeEnd := actualCol, actualCol+span-1
-
-				// 如果当前单元格覆盖了某些“正在进行的纵向合并”的起始列，
-				// 且当前单元格不是该纵向合并的 continuation，则说明纵向合并在上一行结束，需要闭合。
 				isContinuation := cell.IsVMerge && !cell.IsVStart
-				for startCol, st := range activeVMerge {
-					if startCol >= rangeStart && startCol <= rangeEnd {
-						keep := isContinuation && startCol == actualCol
-						if keep {
+				if isContinuation {
+					// continuation 单元格必须落在“正在进行的纵向合并”的那一列，否则会导致后续错位
+					nextCol := -1
+					var nextSt vMergeState
+					for startCol, st := range activeVMerge {
+						if usedVMerge[startCol] {
 							continue
 						}
-
-						endRow := excelRowIdx - 1
-						if endRow > st.startRow {
-							startRef, _ := excelize.CoordinatesToCellName(st.startCol, st.startRow)
-							endRef, _ := excelize.CoordinatesToCellName(st.startCol+st.span-1, endRow)
-							mergeActions = append(mergeActions, mergeAction{start: startRef, end: endRef})
+						if startCol >= cursorCol && (nextCol == -1 || startCol < nextCol) {
+							nextCol = startCol
+							nextSt = st
 						}
-						delete(activeVMerge, startCol)
 					}
-				}
+					actualCol := cursorCol
+					if nextCol != -1 {
+						actualCol = nextCol
+						span = nextSt.span // continuation 的 span 以起始单元格为准
+						usedVMerge[nextCol] = true
+					}
+					rangeStart, rangeEnd := actualCol, actualCol+span-1
 
-				// 纵向合并的 continuation 单元格：不写值，只占位（否则会导致后续列错位）
-				if isContinuation {
 					for c := rangeStart; c <= rangeEnd; c++ {
 						occupied[fmt.Sprintf("%d,%d", excelRowIdx, c)] = true
 					}
 					cursorCol = rangeEnd + 1
 					continue
 				}
+
+				// 普通单元格：在落位前，若当前位置落在某个仍在进行的 vMerge 矩形内，
+				// 但本行并未提供 continuation，则说明该 vMerge 在上一行已经结束，需要先闭合。
+				closeOverlappedVMerge := func(col int) bool {
+					for startCol, st := range activeVMerge {
+						if usedVMerge[startCol] {
+							continue
+						}
+						if col >= startCol && col <= startCol+st.span-1 {
+							endRow := excelRowIdx - 1
+							if endRow > st.startRow {
+								startRef, _ := excelize.CoordinatesToCellName(st.startCol, st.startRow)
+								endRef, _ := excelize.CoordinatesToCellName(st.startCol+st.span-1, endRow)
+								mergeActions = append(mergeActions, mergeAction{start: startRef, end: endRef})
+							}
+							delete(activeVMerge, startCol)
+							return true
+						}
+					}
+					return false
+				}
+
+				for closeOverlappedVMerge(cursorCol) {
+				}
+
+				// 找到本行下一个可用列（跳过被水平合并占用的列）
+				for occupied[fmt.Sprintf("%d,%d", excelRowIdx, cursorCol)] {
+					cursorCol++
+					for closeOverlappedVMerge(cursorCol) {
+					}
+				}
+
+				actualCol := cursorCol
+				rangeStart, rangeEnd := actualCol, actualCol+span-1
 
 				cellRef, _ := excelize.CoordinatesToCellName(actualCol, excelRowIdx)
 
@@ -785,6 +829,21 @@ func (a *App) ConvertWordToExcel(wordFilePath string) ConversionResult {
 				}
 
 				if len(cell.Image) > 0 {
+					// 目标效果：图片“嵌入式”（随单元格移动并随单元格缩放）
+					const (
+						targetRowHeight = 60.0 // 约等于 80px（1pt ≈ 1.333px）
+						targetColWidth  = 12.0 // 约等于 84px（Excel 默认字体下）
+					)
+
+					// 调整行高/列宽，尽量确保图片落在单元格范围内
+					// 注意：这里是按“当前图片所在列/行”设置，若同列既有图片又有长文本，可能需要进一步策略化。
+					for c := rangeStart; c <= rangeEnd; c++ {
+						if colName, err := excelize.ColumnNumberToName(c); err == nil {
+							_ = excelFile.SetColWidth(sheetName, colName, colName, targetColWidth)
+						}
+					}
+					_ = excelFile.SetRowHeight(sheetName, excelRowIdx, targetRowHeight)
+
 					imageExt := strings.ToLower(cell.ImageExt)
 					if !strings.HasPrefix(imageExt, ".") {
 						if imageExt == "" {
@@ -807,20 +866,61 @@ func (a *App) ConvertWordToExcel(wordFilePath string) ConversionResult {
 
 					reencodedImage, reencodedExt := reencodeImage(cell.Image, imageExt)
 
+					// vMerge restart 的图片：不用 AutoFit（否则图片会填满整个合并区域），
+					// 改用固定缩放，确保图片只显示在 restart 行，不会拉伸至合并区域。
+					// 非 vMerge 的图片：用 AutoFit 实现嵌入式随单元格缩放。
+					isVMergePic := cell.IsVMerge && cell.IsVStart
+					var picOpts excelize.GraphicOptions
+					if isVMergePic {
+						const (
+							targetBoxPx = 80
+							cellWidthPx = 84
+						)
+						const cellHeightPx = 80
+						imgW, imgH := imageDimensions(reencodedImage)
+						scaleX, scaleY := 1.0, 1.0
+						offsetX, offsetY := 0, 0
+						if imgW > 0 && imgH > 0 {
+							scale := math.Min(float64(targetBoxPx)/float64(imgW), float64(targetBoxPx)/float64(imgH))
+							scale = math.Min(1.0, scale) // 只缩小不放大
+							scaleX, scaleY = scale, scale
+							finalW := float64(imgW) * scale
+							finalH := float64(imgH) * scale
+							offsetX = int(math.Round((float64(cellWidthPx) - finalW) / 2))
+							offsetY = int(math.Round((float64(cellHeightPx) - finalH) / 2))
+							if offsetX < 0 {
+								offsetX = 0
+							}
+							if offsetY < 0 {
+								offsetY = 0
+							}
+						}
+						picOpts = excelize.GraphicOptions{
+							Positioning:     "twoCell",
+							LockAspectRatio: true,
+							ScaleX:          scaleX,
+							ScaleY:          scaleY,
+							OffsetX:         offsetX,
+							OffsetY:         offsetY,
+						}
+					} else {
+						picOpts = excelize.GraphicOptions{
+							Positioning:     "twoCell",
+							LockAspectRatio: true,
+							AutoFit:         true,
+						}
+					}
 					picture := &excelize.Picture{
 						Extension: reencodedExt,
 						File:      reencodedImage,
-						Format: &excelize.GraphicOptions{
-							Positioning: "oneCell",
-						},
+						Format:    &picOpts,
 					}
-
-					if err := excelFile.AddPictureFromBytes(sheetName, cellRef, picture); err != nil {
-						return ConversionResult{
-							Success: false,
-							Message: fmt.Sprintf("插入图片失败: %v (扩展名: %s, 图片大小: %d bytes)", err, reencodedExt, len(reencodedImage)),
-						}
-					}
+					// 先缓存图片插入动作，等合并单元格完成后再插入。
+					// 这样可避免：图片插入后再 merge 导致 WPS/部分客户端重算锚点出现错位。
+					pictureActions = append(pictureActions, pictureAction{
+						cellRef: cellRef,
+						pic:     picture,
+					})
 				}
 
 				cursorCol = rangeEnd + 1
@@ -842,6 +942,16 @@ func (a *App) ConvertWordToExcel(wordFilePath string) ConversionResult {
 				return ConversionResult{
 					Success: false,
 					Message: fmt.Sprintf("合并单元格失败: %v", err),
+				}
+			}
+		}
+
+		// 合并完成后再插入图片，降低错位概率
+		for _, pa := range pictureActions {
+			if err := excelFile.AddPictureFromBytes(sheetName, pa.cellRef, pa.pic); err != nil {
+				return ConversionResult{
+					Success: false,
+					Message: fmt.Sprintf("插入图片失败: %v (单元格: %s)", err, pa.cellRef),
 				}
 			}
 		}
