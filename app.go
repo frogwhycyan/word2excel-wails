@@ -6,8 +6,12 @@ import (
 	"context"
 	"encoding/xml"
 	"fmt"
+	"image"
+	"image/jpeg"
+	"image/png"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
@@ -40,7 +44,22 @@ type RowData struct {
 }
 
 type CellData struct {
-	Content string
+	Content  string
+	Image    []byte
+	ImageExt string
+	GridSpan int  // 水平合并列数
+	IsVMerge bool // 是否垂直合并
+	IsVStart bool // 是否是垂直合并起始
+}
+
+type Relationship struct {
+	Id     string `xml:"Id,attr"`
+	Type   string `xml:"Type,attr"`
+	Target string `xml:"Target,attr"`
+}
+
+type Relationships struct {
+	Relationships []Relationship `xml:"Relationship"`
 }
 
 func NewApp() *App {
@@ -91,6 +110,33 @@ func extractTablesFromDocx(filePath string) ([]TableData, error) {
 	}
 	defer reader.Close()
 
+	images := make(map[string][]byte)
+	for _, file := range reader.File {
+		if strings.HasPrefix(file.Name, "word/media/") && !file.FileInfo().IsDir() {
+			imageData, err := readFileFromZip(file)
+			if err == nil {
+				images[file.Name] = imageData
+			}
+		}
+	}
+
+	idToImage := make(map[string]string)
+	for _, file := range reader.File {
+		if file.Name == "word/_rels/document.xml.rels" {
+			relsContent, err := readFileFromZip(file)
+			if err == nil {
+				var rels Relationships
+				if xml.Unmarshal(relsContent, &rels) == nil {
+					for _, rel := range rels.Relationships {
+						if strings.HasPrefix(rel.Target, "media/") {
+							idToImage[rel.Id] = "word/" + rel.Target
+						}
+					}
+				}
+			}
+		}
+	}
+
 	var documentXML []byte
 	for _, file := range reader.File {
 		if file.Name == "word/document.xml" {
@@ -106,7 +152,7 @@ func extractTablesFromDocx(filePath string) ([]TableData, error) {
 		return nil, fmt.Errorf("文档中未找到 word/document.xml")
 	}
 
-	return parseDocumentXML(documentXML)
+	return parseTablesWithImages(documentXML, images, idToImage)
 }
 
 func readFileFromZip(f *zip.File) ([]byte, error) {
@@ -122,6 +168,305 @@ func readFileFromZip(f *zip.File) ([]byte, error) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+func parseTablesWithImages(xmlData []byte, images map[string][]byte, idToImage map[string]string) ([]TableData, error) {
+	xmlData = bytes.TrimPrefix(xmlData, []byte("\xef\xbb\xbf"))
+	content := string(xmlData)
+
+	var tables []TableData
+	currentPos := 0
+
+	for {
+		tblStart := strings.Index(content[currentPos:], "<w:tbl")
+		if tblStart == -1 {
+			break
+		}
+		tblStart += currentPos
+
+		tagEnd := strings.Index(content[tblStart:], ">")
+		if tagEnd == -1 {
+			currentPos = tblStart + 7
+			continue
+		}
+		tagEnd += tblStart + 1
+
+		tblEnd := findEndTag(content, tblStart, "w:tbl")
+		if tblEnd == -1 {
+			currentPos = tagEnd
+			continue
+		}
+
+		tableXML := content[tblStart:tblEnd]
+		table := parseSingleTable(tableXML, images, idToImage)
+		if len(table.Rows) > 0 {
+			tables = append(tables, table)
+		}
+
+		currentPos = tblEnd
+	}
+
+	if len(tables) == 0 {
+		tables = tryParseWithNamespace(xmlData)
+	}
+
+	return tables, nil
+}
+
+func findEndTag(content string, start int, tagName string) int {
+	startTag := "<" + tagName + ">"
+	endTag := "</" + tagName + ">"
+
+	depth := 1
+	searchStart := start + len(startTag)
+
+	for depth > 0 {
+		nextStart := strings.Index(content[searchStart:], startTag)
+		nextEnd := strings.Index(content[searchStart:], endTag)
+
+		if nextEnd == -1 {
+			return -1
+		}
+
+		if nextStart == -1 || nextEnd < nextStart {
+			depth--
+			if depth == 0 {
+				return searchStart + nextEnd + len(endTag)
+			}
+			searchStart += nextEnd + len(endTag)
+		} else {
+			depth++
+			searchStart += nextStart + len(startTag)
+		}
+	}
+
+	return -1
+}
+
+func parseSingleTable(tableXML string, images map[string][]byte, idToImage map[string]string) TableData {
+	var table TableData
+
+	rowStart := 0
+	for {
+		trStart := strings.Index(tableXML[rowStart:], "<w:tr")
+		if trStart == -1 {
+			break
+		}
+		trStart += rowStart
+
+		tagEnd := strings.Index(tableXML[trStart:], ">")
+		if tagEnd == -1 {
+			rowStart = trStart + 6
+			continue
+		}
+
+		trEnd := findEndTag(tableXML, trStart, "w:tr")
+		if trEnd == -1 {
+			rowStart = trStart + tagEnd + 1
+			continue
+		}
+
+		row := parseRow(tableXML[trStart:trEnd], images, idToImage)
+		if len(row.Cells) > 0 {
+			table.Rows = append(table.Rows, row)
+		}
+
+		rowStart = trEnd
+	}
+
+	return table
+}
+
+func parseRow(rowXML string, images map[string][]byte, idToImage map[string]string) RowData {
+	var row RowData
+	tcStart := 0
+
+	for {
+		tcStartIdx := strings.Index(rowXML[tcStart:], "<w:tc")
+		if tcStartIdx == -1 {
+			break
+		}
+		tcStartIdx += tcStart
+
+		tagEnd := strings.Index(rowXML[tcStartIdx:], ">")
+		if tagEnd == -1 {
+			tcStart = tcStartIdx + 6
+			continue
+		}
+
+		tcEnd := findEndTag(rowXML, tcStartIdx, "w:tc")
+		if tcEnd == -1 {
+			tcStart = tcStartIdx + tagEnd + 1
+			continue
+		}
+
+		cell := parseCell(rowXML[tcStartIdx:tcEnd], images, idToImage)
+		row.Cells = append(row.Cells, cell)
+
+		tcStart = tcEnd
+	}
+
+	return row
+}
+
+func extractGridSpan(cellXML string) int {
+	gridSpanStart := strings.Index(cellXML, "<w:gridSpan")
+	if gridSpanStart == -1 {
+		return 1
+	}
+
+	valStart := strings.Index(cellXML[gridSpanStart:], "w:val=\"")
+	if valStart == -1 {
+		return 1
+	}
+	valStart += gridSpanStart + 7
+
+	valEnd := strings.Index(cellXML[valStart:], "\"")
+	if valEnd == -1 {
+		return 1
+	}
+
+	var span int
+	fmt.Sscanf(cellXML[valStart:valStart+valEnd], "%d", &span)
+	if span < 1 {
+		span = 1
+	}
+	return span
+}
+
+func extractVMerge(cellXML string) (bool, bool) {
+	vMergeStart := strings.Index(cellXML, "<w:vMerge")
+	if vMergeStart == -1 {
+		return false, false
+	}
+
+	valStart := strings.Index(cellXML[vMergeStart:], "w:val=\"")
+	if valStart == -1 {
+		// WordprocessingML 中 <w:vMerge/> 通常表示“继续合并”（continue）
+		return true, false
+	}
+	valStart += vMergeStart + 7
+
+	valEnd := strings.Index(cellXML[valStart:], "\"")
+	if valEnd == -1 {
+		return true, false
+	}
+
+	val := cellXML[valStart : valStart+valEnd]
+	if val == "restart" {
+		return true, true
+	}
+	return true, false
+}
+
+func parseCell(cellXML string, images map[string][]byte, idToImage map[string]string) CellData {
+	var cell CellData
+	var textBuffer strings.Builder
+
+	if strings.Contains(cellXML, "r:embed=\"") {
+		embedIdx := strings.Index(cellXML, "r:embed=\"")
+		if embedIdx != -1 {
+			embedIdx += 9
+			quoteIdx := strings.Index(cellXML[embedIdx:], "\"")
+			if quoteIdx != -1 {
+				embedId := cellXML[embedIdx : embedIdx+quoteIdx]
+				if imagePath, ok := idToImage[embedId]; ok {
+					if imageData, ok := images[imagePath]; ok {
+						cell.Image = imageData
+						cell.ImageExt = filepath.Ext(imagePath)
+					}
+				}
+			}
+		}
+	}
+
+	cell.GridSpan = extractGridSpan(cellXML)
+	cell.IsVMerge, cell.IsVStart = extractVMerge(cellXML)
+
+	tStart := 0
+	for {
+		tIdx := strings.Index(cellXML[tStart:], "<w:t>")
+		if tIdx == -1 {
+			break
+		}
+		tIdx += tStart + 5
+
+		tEndIdx := strings.Index(cellXML[tIdx:], "</w:t>")
+		if tEndIdx == -1 {
+			break
+		}
+
+		textBuffer.WriteString(cellXML[tIdx : tIdx+tEndIdx])
+		tStart = tIdx + tEndIdx + 6
+	}
+
+	cell.Content = strings.TrimSpace(textBuffer.String())
+	return cell
+}
+
+func detectImageFormat(data []byte) string {
+	if len(data) < 4 {
+		return ""
+	}
+	if data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF {
+		return "jpeg"
+	}
+	if data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47 {
+		return "png"
+	}
+	if data[0] == 0x47 && data[1] == 0x49 && data[2] == 0x46 && data[3] == 0x38 {
+		return "gif"
+	}
+	if len(data) >= 12 && string(data[0:6]) == "GIF87a" || string(data[0:6]) == "GIF89a" {
+		return "gif"
+	}
+	return ""
+}
+
+func normalizeImageExtension(ext string) string {
+	switch ext {
+	case "jpg", "jpeg", "jpe":
+		return "jpeg"
+	case "png":
+		return "png"
+	case "gif":
+		return "gif"
+	case "bmp":
+		return "bmp"
+	case "tiff", "tif":
+		return "tiff"
+	default:
+		return ""
+	}
+}
+
+func reencodeImage(data []byte, ext string) ([]byte, string) {
+	img, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return data, ext
+	}
+
+	var buf bytes.Buffer
+
+	switch ext {
+	case ".jpeg":
+		if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 90}); err != nil {
+			return data, ext
+		}
+	case ".png":
+		if err := png.Encode(&buf, img); err != nil {
+			return data, ext
+		}
+	case ".gif":
+		return data, ext
+	default:
+		if err := png.Encode(&buf, img); err != nil {
+			return data, ext
+		}
+		ext = ".png"
+	}
+
+	return buf.Bytes(), ext
 }
 
 func parseDocumentXML(xmlData []byte) ([]TableData, error) {
@@ -283,6 +628,17 @@ func tryParseWithNamespace(xmlData []byte) []TableData {
 	return tables
 }
 
+type mergeAction struct {
+	start string
+	end   string
+}
+
+type vMergeState struct {
+	startRow int
+	startCol int
+	span     int
+}
+
 func (a *App) ConvertWordToExcel(wordFilePath string) ConversionResult {
 	if wordFilePath == "" {
 		return ConversionResult{
@@ -338,8 +694,7 @@ func (a *App) ConvertWordToExcel(wordFilePath string) ConversionResult {
 		if sheetIndex == 0 {
 			excelFile.SetSheetName("Sheet1", sheetName)
 		} else {
-			_, err := excelFile.NewSheet(sheetName)
-			if err != nil {
+			if _, err := excelFile.NewSheet(sheetName); err != nil {
 				return ConversionResult{
 					Success: false,
 					Message: fmt.Sprintf("创建工作表失败: %v", err),
@@ -347,14 +702,78 @@ func (a *App) ConvertWordToExcel(wordFilePath string) ConversionResult {
 			}
 		}
 
+		// occupied 用于标记本行中被水平合并占用的列，避免后续单元格落到已占用列
+		occupied := make(map[string]bool)
+		var mergeActions []mergeAction
+		activeVMerge := make(map[int]vMergeState) // key = 起始列（startCol）
+
 		for rowIdx, row := range table.Rows {
-			for cellIdx, cell := range row.Cells {
-				cellRef, err := excelize.CoordinatesToCellName(cellIdx+1, rowIdx+1)
-				if err != nil {
-					return ConversionResult{
-						Success: false,
-						Message: fmt.Sprintf("转换单元格坐标失败: %v", err),
+			excelRowIdx := rowIdx + 1
+			cursorCol := 1
+
+			for _, cell := range row.Cells {
+				span := cell.GridSpan
+				if span < 1 {
+					span = 1
+				}
+
+				// 找到本行下一个可用列（跳过被水平合并占用的列）
+				for occupied[fmt.Sprintf("%d,%d", excelRowIdx, cursorCol)] {
+					cursorCol++
+				}
+				actualCol := cursorCol
+				rangeStart, rangeEnd := actualCol, actualCol+span-1
+
+				// 如果当前单元格覆盖了某些“正在进行的纵向合并”的起始列，
+				// 且当前单元格不是该纵向合并的 continuation，则说明纵向合并在上一行结束，需要闭合。
+				isContinuation := cell.IsVMerge && !cell.IsVStart
+				for startCol, st := range activeVMerge {
+					if startCol >= rangeStart && startCol <= rangeEnd {
+						keep := isContinuation && startCol == actualCol
+						if keep {
+							continue
+						}
+
+						endRow := excelRowIdx - 1
+						if endRow > st.startRow {
+							startRef, _ := excelize.CoordinatesToCellName(st.startCol, st.startRow)
+							endRef, _ := excelize.CoordinatesToCellName(st.startCol+st.span-1, endRow)
+							mergeActions = append(mergeActions, mergeAction{start: startRef, end: endRef})
+						}
+						delete(activeVMerge, startCol)
 					}
+				}
+
+				// 纵向合并的 continuation 单元格：不写值，只占位（否则会导致后续列错位）
+				if isContinuation {
+					for c := rangeStart; c <= rangeEnd; c++ {
+						occupied[fmt.Sprintf("%d,%d", excelRowIdx, c)] = true
+					}
+					cursorCol = rangeEnd + 1
+					continue
+				}
+
+				cellRef, _ := excelize.CoordinatesToCellName(actualCol, excelRowIdx)
+
+				// 标记本行水平占用（跳过起始列）
+				for c := actualCol + 1; c <= rangeEnd; c++ {
+					occupied[fmt.Sprintf("%d,%d", excelRowIdx, c)] = true
+				}
+
+				// 纵向合并起始：记录状态（真正的 MergeCell 在“合并结束时/表格结束时”统一追加）
+				if cell.IsVMerge && cell.IsVStart {
+					activeVMerge[actualCol] = vMergeState{
+						startRow: excelRowIdx,
+						startCol: actualCol,
+						span:     span,
+					}
+				}
+
+				// 仅水平合并：立即记录 merge 区间
+				// 如果该单元格同时是纵向合并起始，则由纵向合并闭合时生成“矩形合并”，避免重复/重叠合并。
+				if span > 1 && !(cell.IsVMerge && cell.IsVStart) {
+					endCellRef, _ := excelize.CoordinatesToCellName(rangeEnd, excelRowIdx)
+					mergeActions = append(mergeActions, mergeAction{start: cellRef, end: endCellRef})
 				}
 
 				cellValue := strings.TrimSpace(cell.Content)
@@ -363,6 +782,66 @@ func (a *App) ConvertWordToExcel(wordFilePath string) ConversionResult {
 						Success: false,
 						Message: fmt.Sprintf("写入单元格失败: %v", err),
 					}
+				}
+
+				if len(cell.Image) > 0 {
+					imageExt := strings.ToLower(cell.ImageExt)
+					if !strings.HasPrefix(imageExt, ".") {
+						if imageExt == "" {
+							imageExt = "." + detectImageFormat(cell.Image)
+						} else {
+							imageExt = "." + imageExt
+						}
+					}
+
+					switch imageExt {
+					case ".jpg", ".jpeg":
+						imageExt = ".jpeg"
+					case ".png":
+						imageExt = ".png"
+					case ".gif":
+						imageExt = ".gif"
+					default:
+						imageExt = ".png"
+					}
+
+					reencodedImage, reencodedExt := reencodeImage(cell.Image, imageExt)
+
+					picture := &excelize.Picture{
+						Extension: reencodedExt,
+						File:      reencodedImage,
+						Format: &excelize.GraphicOptions{
+							Positioning: "oneCell",
+						},
+					}
+
+					if err := excelFile.AddPictureFromBytes(sheetName, cellRef, picture); err != nil {
+						return ConversionResult{
+							Success: false,
+							Message: fmt.Sprintf("插入图片失败: %v (扩展名: %s, 图片大小: %d bytes)", err, reencodedExt, len(reencodedImage)),
+						}
+					}
+				}
+
+				cursorCol = rangeEnd + 1
+			}
+		}
+
+		// 表格结束后，闭合所有仍然活跃的纵向合并
+		lastRow := len(table.Rows)
+		for _, st := range activeVMerge {
+			if lastRow > st.startRow {
+				startRef, _ := excelize.CoordinatesToCellName(st.startCol, st.startRow)
+				endRef, _ := excelize.CoordinatesToCellName(st.startCol+st.span-1, lastRow)
+				mergeActions = append(mergeActions, mergeAction{start: startRef, end: endRef})
+			}
+		}
+
+		for _, action := range mergeActions {
+			if err := excelFile.MergeCell(sheetName, action.start, action.end); err != nil {
+				return ConversionResult{
+					Success: false,
+					Message: fmt.Sprintf("合并单元格失败: %v", err),
 				}
 			}
 		}
