@@ -4,6 +4,8 @@ import {main} from '../models';
 
 export function ConvertWordToExcel(arg1:string):Promise<main.ConversionResult>;
 
+export function ConvertWordToExcelFromBytes(arg1:string,arg2:Array<number>):Promise<main.ConversionResult>;
+
 export function OpenWordFile():Promise<main.FileDialogResult>;
 
 export function ProcessDroppedFile(arg1:string):Promise<main.ConversionResult>;

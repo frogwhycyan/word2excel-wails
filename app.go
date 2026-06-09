@@ -1024,3 +1024,40 @@ func (a *App) ProcessDroppedFile(filePath string) ConversionResult {
 
 	return a.ConvertWordToExcel(filePath)
 }
+
+// ConvertWordToExcelFromBytes 接收拖拽文件的文件名和字节数据，先写入临时目录再调用转换逻辑。
+// 解决浏览器拖拽 API 无法传递完整文件路径的问题。
+func (a *App) ConvertWordToExcelFromBytes(fileName string, fileData []byte) ConversionResult {
+	if len(fileData) == 0 {
+		return ConversionResult{
+			Success: false,
+			Message: "拖拽的文件数据为空",
+		}
+	}
+
+	// 写入临时文件
+	// 1. 提取纯文件名（如 "用户报告.docx" -> "用户报告"）
+	baseName := filepath.Base(fileName)
+	oldExt := filepath.Ext(baseName)
+	pureName := strings.TrimSuffix(baseName, oldExt)
+
+	// 2. 【核心改动】获取系统临时目录，自己手动拼接路径，不让系统加随机数字！
+	// 最终生成的路径会是绝对干净的：/tmp/用户报告.docx
+	tmpDir := os.TempDir()
+	tmpPath := filepath.Join(tmpDir, pureName+".docx")
+
+	// 3. 直接写入文件
+	if err := os.WriteFile(tmpPath, fileData, 0644); err != nil {
+		return ConversionResult{
+			Success: false,
+			Message: fmt.Sprintf("写入临时文件失败: %v", err),
+		}
+	}
+
+	// 函数执行完后，依然自动把这个干净的临时文件删掉
+	defer os.Remove(tmpPath)
+
+	// 4. 此时传过去的文件名是干净的 "用户报告.docx"
+	// 你的后面的函数无论是校验 .docx，还是最后替换成 .xlsx，都会是完美的 "用户报告.xlsx"
+	return a.ConvertWordToExcel(tmpPath)
+}

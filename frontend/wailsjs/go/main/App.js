@@ -6,6 +6,10 @@ export function ConvertWordToExcel(arg1) {
   return window['go']['main']['App']['ConvertWordToExcel'](arg1);
 }
 
+export function ConvertWordToExcelFromBytes(arg1, arg2) {
+  return window['go']['main']['App']['ConvertWordToExcelFromBytes'](arg1, arg2);
+}
+
 export function OpenWordFile() {
   return window['go']['main']['App']['OpenWordFile']();
 }

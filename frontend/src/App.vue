@@ -49,7 +49,7 @@
 
 <script setup lang="ts">
 import {ref, computed} from 'vue';
-import {OpenWordFile, ConvertWordToExcel, ProcessDroppedFile} from '../wailsjs/go/main/App';
+import {OpenWordFile, ConvertWordToExcel, ConvertWordToExcelFromBytes} from '../wailsjs/go/main/App';
 
 interface FileDialogResult {
   success: boolean;
@@ -100,10 +100,23 @@ async function onDrop(event: DragEvent) {
     return;
   }
 
-  selectedFile.value = file.path || file.name;
-  resultMessage.value = '';
-
-  await convertFile();
+  isProcessing.value = true;
+  try {
+    // 浏览器拖拽 API 无法获取文件的完整路径，只能读取文件内容。
+    // 手动读取字节后传给 Go 后端处理。
+    const arrayBuffer = await file.arrayBuffer();
+    const uint8Array = new Uint8Array(arrayBuffer);
+    const result: ConversionResult = await ConvertWordToExcelFromBytes(file.name, Array.from(uint8Array));
+    isSuccess.value = result.success;
+    resultMessage.value = result.message;
+    excelPath.value = result.excelPath || '';
+  } catch (error) {
+    console.error('处理拖拽文件失败:', error);
+    isSuccess.value = false;
+    resultMessage.value = '处理拖拽文件失败: ' + (error as Error).message;
+  } finally {
+    isProcessing.value = false;
+  }
 }
 
 async function selectFile() {
