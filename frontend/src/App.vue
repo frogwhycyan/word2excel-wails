@@ -1,47 +1,53 @@
 <template>
   <div id="app">
-    <div class="container">
-      <header>
-        <h1>Word 转 Excel</h1>
-        <p class="subtitle">将 Word 文档中的表格快速转换为 Excel 文件</p>
-      </header>
+    <!-- 激活鉴权页面 -->
+    <LicenseAuth v-if="!isAuthorized" @auth-success="onAuthSuccess" />
 
-      <div
-        class="drop-zone"
-        :class="{ 'drag-over': isDragOver, 'has-file': selectedFile }"
-        @dragover.prevent="onDragOver"
-        @dragleave="onDragLeave"
-        @drop.prevent="onDrop"
-        @click="selectFile"
-      >
-        <div v-if="!selectedFile && !isProcessing" class="drop-zone-content">
-          <div class="icon">📄</div>
-          <p class="main-text">点击选择 Word 文件 或 拖拽文件到此处</p>
-          <p class="sub-text">支持 .docx 格式</p>
+    <!-- 主应用页面 -->
+    <div v-else class="main-app">
+      <div class="container">
+        <header>
+          <h1>Word 转 Excel</h1>
+          <p class="subtitle">将 Word 文档中的表格快速转换为 Excel 文件</p>
+        </header>
+
+        <div
+          class="drop-zone"
+          :class="{ 'drag-over': isDragOver, 'has-file': selectedFile }"
+          @dragover.prevent="onDragOver"
+          @dragleave="onDragLeave"
+          @drop.prevent="onDrop"
+          @click="selectFile"
+        >
+          <div v-if="!selectedFile && !isProcessing" class="drop-zone-content">
+            <div class="icon">📄</div>
+            <p class="main-text">点击选择 Word 文件 或 拖拽文件到此处</p>
+            <p class="sub-text">支持 .docx 格式</p>
+          </div>
+
+          <div v-if="selectedFile && !isProcessing" class="file-info">
+            <div class="icon">✅</div>
+            <p class="file-name">{{ fileName }}</p>
+            <button class="change-btn" @click.stop="selectFile">更换文件</button>
+          </div>
+
+          <div v-if="isProcessing" class="processing">
+            <div class="spinner"></div>
+            <p>正在解析并转换中...</p>
+          </div>
         </div>
 
-        <div v-if="selectedFile && !isProcessing" class="file-info">
-          <div class="icon">✅</div>
-          <p class="file-name">{{ fileName }}</p>
-          <button class="change-btn" @click.stop="selectFile">更换文件</button>
+        <div v-if="resultMessage" class="result" :class="{ 'success': isSuccess, 'error': !isSuccess }">
+          <div class="result-icon">{{ isSuccess ? '✅' : '❌' }}</div>
+          <p class="result-message">{{ resultMessage }}</p>
+          <p v-if="isSuccess && excelPath" class="result-path">保存位置: {{ excelPath }}</p>
         </div>
 
-        <div v-if="isProcessing" class="processing">
-          <div class="spinner"></div>
-          <p>正在解析并转换中...</p>
+        <div v-if="selectedFile && !isProcessing && !resultMessage" class="action">
+          <button class="convert-btn" @click="convertFile">
+            开始转换
+          </button>
         </div>
-      </div>
-
-      <div v-if="resultMessage" class="result" :class="{ 'success': isSuccess, 'error': !isSuccess }">
-        <div class="result-icon">{{ isSuccess ? '✅' : '❌' }}</div>
-        <p class="result-message">{{ resultMessage }}</p>
-        <p v-if="isSuccess && excelPath" class="result-path">保存位置: {{ excelPath }}</p>
-      </div>
-
-      <div v-if="selectedFile && !isProcessing && !resultMessage" class="action">
-        <button class="convert-btn" @click="convertFile">
-          开始转换
-        </button>
       </div>
     </div>
   </div>
@@ -49,6 +55,7 @@
 
 <script setup lang="ts">
 import {ref, computed} from 'vue';
+import LicenseAuth from './components/LicenseAuth.vue';
 import {OpenWordFile, ConvertWordToExcel, ConvertWordToExcelFromBytes} from '../wailsjs/go/main/App';
 
 interface FileDialogResult {
@@ -64,6 +71,7 @@ interface ConversionResult {
   excelPath: string;
 }
 
+const isAuthorized = ref(false);
 const selectedFile = ref('');
 const isDragOver = ref(false);
 const isProcessing = ref(false);
@@ -76,6 +84,11 @@ const fileName = computed(() => {
   const parts = selectedFile.value.split(/[/\\]/);
   return parts[parts.length - 1];
 });
+
+// 激活成功回调
+function onAuthSuccess() {
+  isAuthorized.value = true;
+}
 
 function onDragOver(event: DragEvent) {
   isDragOver.value = true;
@@ -102,8 +115,6 @@ async function onDrop(event: DragEvent) {
 
   isProcessing.value = true;
   try {
-    // 浏览器拖拽 API 无法获取文件的完整路径，只能读取文件内容。
-    // 手动读取字节后传给 Go 后端处理。
     const arrayBuffer = await file.arrayBuffer();
     const uint8Array = new Uint8Array(arrayBuffer);
     const result: ConversionResult = await ConvertWordToExcelFromBytes(file.name, Array.from(uint8Array));
@@ -166,7 +177,7 @@ async function convertFile() {
   box-sizing: border-box;
 }
 
-#app {
+.main-app {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
   background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
   min-height: 100vh;
