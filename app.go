@@ -386,19 +386,35 @@ func parseCell(cellXML string, images map[string][]byte, idToImage map[string]st
 
 	tStart := 0
 	for {
-		tIdx := strings.Index(cellXML[tStart:], "<w:t>")
+		tIdx := strings.Index(cellXML[tStart:], "<w:t")
 		if tIdx == -1 {
 			break
 		}
-		tIdx += tStart + 5
+		tIdx += tStart
 
-		tEndIdx := strings.Index(cellXML[tIdx:], "</w:t>")
+		// 确保匹配的是 <w:t> 或 <w:t ...>，而不是 <w:tc...> 等其他标签
+		// 检查 <w:t 后面必须是空格（属性开始）或 >（标签结束）
+		afterTag := tIdx + 4
+		if afterTag >= len(cellXML) || (cellXML[afterTag] != ' ' && cellXML[afterTag] != '>') {
+			// 不是 <w:t> 或 <w:t ...>，跳过继续搜索
+			tStart = tIdx + 4
+			continue
+		}
+
+		// 找到 <w:t> 或 <w:t ...> 的结束位置（即 > 字符）
+		tagEndIdx := strings.Index(cellXML[tIdx:], ">")
+		if tagEndIdx == -1 {
+			break
+		}
+		tagEndIdx += tIdx + 1
+
+		tEndIdx := strings.Index(cellXML[tagEndIdx:], "</w:t>")
 		if tEndIdx == -1 {
 			break
 		}
 
-		textBuffer.WriteString(cellXML[tIdx : tIdx+tEndIdx])
-		tStart = tIdx + tEndIdx + 6
+		textBuffer.WriteString(cellXML[tagEndIdx : tagEndIdx+tEndIdx])
+		tStart = tagEndIdx + tEndIdx + 6
 	}
 
 	cell.Content = strings.TrimSpace(textBuffer.String())
